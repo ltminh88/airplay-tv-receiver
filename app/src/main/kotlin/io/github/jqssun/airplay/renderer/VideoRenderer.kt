@@ -3,9 +3,22 @@ package io.github.jqssun.airplay.renderer
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import java.util.ArrayDeque
 
+/**
+ * Async (callback-based) H.264/H.265 decoder → Surface.
+ *
+ * Why async: the previous synchronous design only drained the decoder's output buffers as a
+ * side-effect of feeding a new input frame. For low-frame-rate / static mirror content (idle
+ * desktop, home screen) the decoded frames sat in the output buffers and were never released to
+ * the Surface, so the screen stayed black or froze on the first frame. With MediaCodec.setCallback,
+ * onOutputBufferAvailable fires whenever a frame finishes decoding — independent of input cadence —
+ * so frames are rendered continuously even when the source sends them sparsely.
+ */
 class VideoRenderer {
 
     private val lock = Object()
@@ -16,7 +29,14 @@ class VideoRenderer {
     private var videoWidth = 0
     private var videoHeight = 0
 
-    // cache last keyframe so decoder can bootstrap after late surface attach
+    // async plumbing
+    private var callbackThread: HandlerThread? = null
+    private val availableInputs = ArrayDeque<Int>()        // input buffer indices the codec handed us
+    private val pendingFrames = ArrayDeque<Frame>()        // frames waiting for an input buffer
+    private data class Frame(val data: ByteArray, val ptsUs: Long)
+    private val MAX_PENDING = 8                            // bound the backlog; drop oldest beyond this
+
+    // cache last keyframe so decoder can bootstrap after late surface attach / codec restart
     private var cachedKeyframe: ByteArray? = null
     private var cachedKeyframePts: Long = 0
     private var cachedKeyframeH265 = false
@@ -29,11 +49,11 @@ class VideoRenderer {
     @Volatile var droppedFrames = 0L; private set
     @Volatile var framePacingJitterUs = 0L; private set
 
-    var enforceSdr = true
+    var enforceSdr = false
     var keyAllowFrameDrop = true
     var realtimeDecoderPriority = true
     var operatingRateHint = false
-    var scheduledOutputBufferRelease = true
+    var scheduledOutputBufferRelease = false
     var benchmarkLog = false
     var benchmarkLogCallback: ((String) -> Unit)? = null
     private var _framesThisSec = 0
@@ -55,7 +75,17 @@ class VideoRenderer {
     fun setSurface(surface: Surface?) = synchronized(lock) {
         val changed = this.surface !== surface
         this.surface = surface
-        if (changed && codec != null) stopCodec()
+        if (!changed) return@synchronized
+        if (codec != null) stopCodec()
+        // Proactively bootstrap on a fresh surface: if the stream already started (we have a cached
+        // keyframe + known resolution) but the source isn't sending a new frame yet (static screen),
+        // start the decoder now and feed the keyframe so the first connect shows an image instead of
+        // staying black until the next IDR / reconnect.
+        if (surface != null && cachedKeyframe != null && videoWidth > 0 && videoHeight > 0) {
+            startCodec(cachedKeyframeH265)
+            cachedKeyframe?.let { _enqueue(it, cachedKeyframePts / 1000) }
+            _pumpInputs()
+        }
     }
 
     private fun _updateStats(size: Int) {
@@ -96,34 +126,47 @@ class VideoRenderer {
         synchronized(lock) {
             if (surface == null) return
 
-            // codec switch when needed
+            // (re)start codec on first frame or codec/profile switch
             if (codec == null || isH265 != currentH265) {
                 stopCodec()
                 startCodec(isH265)
-                // feed cached keyframe to bootstrap decoder
+                // bootstrap the fresh decoder with the cached keyframe so it can show a frame
+                // immediately instead of waiting for the source's next IDR
                 cachedKeyframe?.let { kf ->
-                    if (cachedKeyframeH265 == isH265) {
-                        _feedToCodec(kf, cachedKeyframePts)
-                    }
+                    if (cachedKeyframeH265 == isH265) _enqueue(kf, cachedKeyframePts / 1000)
                 }
             }
 
-            _feedToCodec(data, ntpTimeNs)
-            drainOutput()
+            _enqueue(data, ntpTimeNs / 1000)
+            _pumpInputs()
         }
     }
 
-    private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long) {
-        val c = codec ?: return
-        val idx = c.dequeueInputBuffer(5000)
-        if (idx >= 0) {
-            val buf = c.getInputBuffer(idx) ?: return
-            buf.clear()
-            buf.put(data)
-            c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
-        } else {
+    /** Queue a frame for decoding; drop the oldest if the backlog grows unbounded. */
+    private fun _enqueue(data: ByteArray, ptsUs: Long) {
+        if (pendingFrames.size >= MAX_PENDING) {
+            pendingFrames.pollFirst()
             droppedFrames++
-            Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
+        }
+        pendingFrames.addLast(Frame(data, ptsUs))
+    }
+
+    /** Feed queued frames into any input buffers the codec has made available. Caller holds lock. */
+    private fun _pumpInputs() {
+        val c = codec ?: return
+        while (availableInputs.isNotEmpty() && pendingFrames.isNotEmpty()) {
+            val idx = availableInputs.pollFirst()
+            val frame = pendingFrames.pollFirst()
+            try {
+                val buf = c.getInputBuffer(idx) ?: continue
+                buf.clear()
+                buf.put(frame.data)
+                c.queueInputBuffer(idx, 0, frame.data.size, frame.ptsUs, 0)
+            } catch (e: IllegalStateException) {
+                // codec was torn down mid-feed; stop touching it
+                Log.w(TAG, "queueInputBuffer failed (codec stopping): ${e.message}")
+                return
+            }
         }
     }
 
@@ -168,13 +211,58 @@ class VideoRenderer {
             format.setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, if (keyAllowFrameDrop) 1 else 0)
         }
 
-        codec = MediaCodec.createDecoderByType(mime).also {
-            it.configure(format, s, null, 0)
-            it.start()
-        }
+        availableInputs.clear()
+        pendingFrames.clear()
+        _ptsBaseUs = Long.MIN_VALUE
+        _wallBaseNs = 0L
+
+        val thread = HandlerThread("VideoRendererCb").also { it.start() }
+        callbackThread = thread
+        val c = MediaCodec.createDecoderByType(mime)
+        c.setCallback(object : MediaCodec.Callback() {
+            override fun onInputBufferAvailable(mc: MediaCodec, index: Int) {
+                synchronized(lock) {
+                    if (codec !== mc) return
+                    availableInputs.addLast(index)
+                    _pumpInputs()
+                }
+            }
+
+            override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                // render outside the lock to avoid blocking input feeding / stopCodec
+                try {
+                    if (scheduledOutputBufferRelease) {
+                        val ptsUs = info.presentationTimeUs
+                        synchronized(lock) {
+                            if (_ptsBaseUs == Long.MIN_VALUE) {
+                                _ptsBaseUs = ptsUs; _wallBaseNs = System.nanoTime()
+                            }
+                        }
+                        mc.releaseOutputBuffer(index, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
+                    } else {
+                        mc.releaseOutputBuffer(index, true)   // render immediately
+                    }
+                    _recordOutputFrameTime()
+                } catch (e: IllegalStateException) {
+                    // codec stopped between callback dispatch and release; ignore
+                }
+            }
+
+            override fun onOutputFormatChanged(mc: MediaCodec, format: MediaFormat) {
+                Log.i(TAG, "Output format changed: $format")
+            }
+
+            override fun onError(mc: MediaCodec, e: MediaCodec.CodecException) {
+                Log.e(TAG, "Codec error: ${e.message} (recoverable=${e.isRecoverable} transient=${e.isTransient})")
+            }
+        }, Handler(thread.looper))
+
+        c.configure(format, s, null, 0)
+        c.start()
+        codec = c
         codecName = if (h265) "H.265" else "H.264"
         running = true
-        Log.i(TAG, "Video codec started: $mime")
+        Log.i(TAG, "Video codec started (async): $mime ${videoWidth}x${videoHeight}")
     }
 
     private fun stopCodec() {
@@ -184,37 +272,19 @@ class VideoRenderer {
         _lastOutputFrameNs = 0L
         _ptsBaseUs = Long.MIN_VALUE
         _wallBaseNs = 0L
-        codec?.let {
+        val c = codec
+        codec = null   // null first so in-flight callbacks bail out (they check codec !== mc)
+        c?.let {
             try {
+                it.setCallback(null)
                 it.stop()
                 it.release()
             } catch (_: Exception) {}
         }
-        codec = null
-    }
-
-    private fun drainOutput() {
-        val c = codec ?: return
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            val idx = c.dequeueOutputBuffer(info, 0)
-            if (idx >= 0) {
-                _recordOutputFrameTime()
-                if (scheduledOutputBufferRelease) {
-                    // schedule the frame at the VSYNC matching its NTP presentation time
-                    val ptsUs = info.presentationTimeUs
-                    if (_ptsBaseUs == Long.MIN_VALUE) {
-                        _ptsBaseUs = ptsUs
-                        _wallBaseNs = System.nanoTime()
-                    }
-                    c.releaseOutputBuffer(idx, _wallBaseNs + (ptsUs - _ptsBaseUs) * 1000L)
-                } else {
-                    c.releaseOutputBuffer(idx, true)
-                }
-            } else {
-                break
-            }
-        }
+        callbackThread?.quitSafely()
+        callbackThread = null
+        availableInputs.clear()
+        pendingFrames.clear()
     }
 
     fun release() = synchronized(lock) {
@@ -228,12 +298,14 @@ class VideoRenderer {
 
     private fun _recordOutputFrameTime() {
         val now = System.nanoTime()
-        if (_lastOutputFrameNs > 0) {
-            _frameIntervalsNs[_frameIntervalIdx % _frameIntervalsNs.size] = now - _lastOutputFrameNs
-            _frameIntervalIdx++
-            _frameIntervalCount++
+        synchronized(lock) {
+            if (_lastOutputFrameNs > 0) {
+                _frameIntervalsNs[_frameIntervalIdx % _frameIntervalsNs.size] = now - _lastOutputFrameNs
+                _frameIntervalIdx++
+                _frameIntervalCount++
+            }
+            _lastOutputFrameNs = now
         }
-        _lastOutputFrameNs = now
     }
 
     private fun _computeFramePacingJitterUs(): Long {

@@ -67,6 +67,13 @@ fun MainScreen(
         }
     }
 
+    // exit fullscreen on disconnect: otherwise the SurfaceView stays mounted and keeps showing
+    // the last decoded frame after the client leaves (stale frozen image). Dropping out of
+    // fullscreen unmounts the surface and returns to the "waiting for connection" screen.
+    LaunchedEffect(connections) {
+        if (connections == 0) fullscreen = false
+    }
+
     val activity = LocalContext.current as? Activity
     LaunchedEffect(fullscreen) {
         val window = activity?.window ?: return@LaunchedEffect
