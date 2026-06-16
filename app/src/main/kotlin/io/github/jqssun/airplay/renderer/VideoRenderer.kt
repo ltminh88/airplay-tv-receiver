@@ -48,8 +48,26 @@ class VideoRenderer {
     @Volatile var codecName = ""; private set
     @Volatile var droppedFrames = 0L; private set
     @Volatile var framePacingJitterUs = 0L; private set
+    // diagnostic: frames actually released to the surface (onOutputBufferAvailable)
+    @Volatile private var _renderedTotal = 0L
+    private var _renderedAtLastReset = 0L
+    // stall watchdog: the Amlogic decoder can wedge after a long session (keeps accepting input but
+    // stops emitting output). Detect "fed but nothing rendered" for N seconds and auto-restart the
+    // codec so the user doesn't have to disconnect/reconnect by hand.
+    private var _stalledSecs = 0
+    @Volatile private var _stallRestartNeeded = false
+    // frames actually handed to the codec (queueInputBuffer). The stall watchdog keys off this, not
+    // "frames received": while we're cleanly skipping to a keyframe we feed nothing, so that gap must
+    // NOT look like a stall — only "fed the codec but it emitted nothing" is a real decoder wedge.
+    @Volatile private var _queuedTotal = 0L
+    private var _queuedAtLastReset = 0L
+    // after a reset/overflow, decode must resume only from a fresh IDR (keyframe); feeding P-frames
+    // with a broken reference chain produces cursor ghosting/trails and re-stalls the decoder.
+    @Volatile private var _waitingForKeyframe = false
+    private var _waitingSecs = 0   // bound the keyframe-resync wait so it can never freeze forever
+    private var _consecutiveRestarts = 0   // cap watchdog restarts so a true HW wedge can't thrash-loop
 
-    var enforceSdr = false
+    var enforceSdr = true
     var keyAllowFrameDrop = true
     var realtimeDecoderPriority = true
     var operatingRateHint = false
@@ -94,6 +112,51 @@ class VideoRenderer {
             fps = _framesThisSec
             bitrateBps = _bytesThisSec * 8
             framePacingJitterUs = _computeFramePacingJitterUs()
+            val renderedThisSec = _renderedTotal - _renderedAtLastReset
+            _renderedAtLastReset = _renderedTotal
+            // stall watchdog: frames fed but none rendered => decoder wedged. After 2 such seconds,
+            // flag a codec restart (handled in feedFrame under lock).
+            // wedge signal: frames keep ARRIVING from the source (fps>0) but the decoder renders
+            // nothing. When the Amlogic decoder wedges it stops both emitting output AND handing back
+            // input buffers, so a "queued-based" signal goes blind — keying off received frames
+            // catches it. The old restart-thrash that motivated avoiding this is gone now: after a
+            // restart we skip to a clean keyframe before feeding, so the fresh codec can't re-stall
+            // on a broken chain. 3s threshold tolerates the brief keyframe-resync gap.
+            val queuedThisSec = _queuedTotal - _queuedAtLastReset
+            _queuedAtLastReset = _queuedTotal
+            // Safety bound: if we've been skipping while waiting for a keyframe for too long (the
+            // source's IDR is late, or detection missed it), stop waiting and resume feeding. A brief
+            // visual glitch is far better than a permanent freeze (queued stays 0 -> nothing decodes).
+            if (_waitingForKeyframe) {
+                _waitingSecs++
+                if (_waitingSecs >= 2) {
+                    _waitingForKeyframe = false
+                    _waitingSecs = 0
+                    Log.w(TAG, "keyframe wait timed out -> resuming feed without resync")
+                }
+            } else {
+                _waitingSecs = 0
+            }
+            if (renderedThisSec > 0L) _consecutiveRestarts = 0   // confirmed recovery
+            if (fps > 0 && renderedThisSec == 0L) {
+                _stalledSecs++
+                // give up after a few failed restarts: a true HW-decoder wedge needs a fresh IDR
+                // (only a client reconnect provides one), so looping restarts just thrashes.
+                if (_stalledSecs >= 3 && _consecutiveRestarts < 4) {
+                    _stallRestartNeeded = true
+                    _consecutiveRestarts++
+                    Log.w(TAG, "decoder stall (${_stalledSecs}s, restart #$_consecutiveRestarts: fed=$fps queued=$queuedThisSec) -> restarting codec")
+                } else if (_consecutiveRestarts >= 4) {
+                    Log.w(TAG, "decoder wedged after $_consecutiveRestarts restarts; needs client reconnect")
+                }
+            } else {
+                _stalledSecs = 0
+            }
+            // always-on lightweight diagnostic: fed vs rendered tells us if frames arrive but never
+            // reach the surface (decoder stall) vs simply aren't being sent (source idle)
+            Log.i(TAG, "video: fed/s=$fps rendered/s=$renderedThisSec bitrate=${bitrateBps / 1000}kbps " +
+                "totalFed=$frameCount totalRendered=$_renderedTotal dropped=$droppedFrames " +
+                "codec=$codecName ${videoWidth}x${videoHeight}")
             _framesThisSec = 0
             _bytesThisSec = 0
             _lastStatReset = now
@@ -126,14 +189,34 @@ class VideoRenderer {
         synchronized(lock) {
             if (surface == null) return
 
+            // watchdog-triggered recovery: tear down the wedged codec so the block below restarts it
+            // and re-bootstraps from the cached keyframe.
+            if (_stallRestartNeeded) {
+                _stallRestartNeeded = false
+                _stalledSecs = 0
+                stopCodec()
+            }
+
             // (re)start codec on first frame or codec/profile switch
             if (codec == null || isH265 != currentH265) {
                 stopCodec()
                 startCodec(isH265)
-                // bootstrap the fresh decoder with the cached keyframe so it can show a frame
-                // immediately instead of waiting for the source's next IDR
+                // bootstrap the fresh decoder with the cached keyframe so it shows a frame
+                // immediately, then resync to the source's next real IDR before decoding live frames
                 cachedKeyframe?.let { kf ->
                     if (cachedKeyframeH265 == isH265) _enqueue(kf, cachedKeyframePts / 1000)
+                }
+                _waitingForKeyframe = true
+            }
+
+            // resync gate: until a fresh keyframe arrives, skip frames instead of feeding P-frames
+            // onto a broken reference chain (which causes cursor trails and re-stalls)
+            if (_waitingForKeyframe) {
+                if (_isKeyframe(data, isH265)) {
+                    _waitingForKeyframe = false
+                } else {
+                    _pumpInputs()   // still push any already-queued bootstrap keyframe
+                    return
                 }
             }
 
@@ -142,11 +225,14 @@ class VideoRenderer {
         }
     }
 
-    /** Queue a frame for decoding; drop the oldest if the backlog grows unbounded. */
+    /** Queue a frame; if the decoder fell behind, skip cleanly to the next keyframe (don't drop
+     *  mid-GOP — that breaks the P-frame reference chain and causes cursor trails). */
     private fun _enqueue(data: ByteArray, ptsUs: Long) {
         if (pendingFrames.size >= MAX_PENDING) {
-            pendingFrames.pollFirst()
+            pendingFrames.clear()
+            _waitingForKeyframe = true
             droppedFrames++
+            return
         }
         pendingFrames.addLast(Frame(data, ptsUs))
     }
@@ -162,6 +248,7 @@ class VideoRenderer {
                 buf.clear()
                 buf.put(frame.data)
                 c.queueInputBuffer(idx, 0, frame.data.size, frame.ptsUs, 0)
+                _queuedTotal++
             } catch (e: IllegalStateException) {
                 // codec was torn down mid-feed; stop touching it
                 Log.w(TAG, "queueInputBuffer failed (codec stopping): ${e.message}")
@@ -171,20 +258,27 @@ class VideoRenderer {
     }
 
     private fun _isKeyframe(data: ByteArray, isH265: Boolean): Boolean {
-        if (data.size < 5) return false
+        if (data.size < 4) return false
         var i = 0
-        while (i <= data.size - 5) {
-            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
-                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()) {
-                return if (isH265) {
-                    val type = (data[i + 4].toInt() shr 1) and 0x3F
-                    type == 19 || type == 20 || type == 32 || type == 33
+        // Scan for a NAL start code. Match the 3-byte form (00 00 01); the 4-byte form
+        // (00 00 00 01) contains it at offset+1, so this covers both. macOS emits mid-stream IDRs
+        // with 3-byte start codes — only matching 4-byte missed them, so the keyframe-resync gate
+        // never cleared and the stream froze.
+        while (i <= data.size - 4) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()) {
+                val nal = data[i + 3].toInt()
+                val isKey = if (isH265) {
+                    val type = (nal shr 1) and 0x3F
+                    type == 19 || type == 20 || type == 32 || type == 33   // IDR / VPS / SPS
                 } else {
-                    val type = data[i + 4].toInt() and 0x1F
-                    type == 5 || type == 7
+                    val type = nal and 0x1F
+                    type == 5 || type == 7                                  // IDR / SPS
                 }
+                if (isKey) return true
+                i += 3
+            } else {
+                i++
             }
-            i++
         }
         return false
     }
@@ -194,11 +288,24 @@ class VideoRenderer {
         currentH265 = h265
         val mime = if (h265) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
 
-        val format = MediaFormat.createVideoFormat(mime, videoWidth, videoHeight)
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024)
+        // Configure with 16-aligned (macroblock) dimensions. H.264 codes frames in 16px macroblocks
+        // and signals the real size via an SPS crop rect (e.g. iPhone portrait 498x1080 -> coded
+        // 512x1088, crop to 498x1080). Passing the non-aligned 498 here makes the Amlogic decoder
+        // accept input but never emit output (rendered stays 0). Rounding up lets it decode; the
+        // decoder applies the SPS crop so the displayed image is still correct.
+        val alignedW = (videoWidth + 15) and 15.inv()
+        val alignedH = (videoHeight + 15) and 15.inv()
+        val format = MediaFormat.createVideoFormat(mime, alignedW, alignedH)
+        // Size the input buffer to a full luma plane (w*h). The old flat 1 MB cap truncated large
+        // 1080p keyframes -> blocky/soft decode that persisted until the next full IDR. Generous
+        // sizing lets whole compressed frames through so detail (e.g. small text) stays sharp.
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, (alignedW * alignedH).coerceAtLeast(1024 * 1024))
         if (enforceSdr) {
+            // Desktop screen mirroring (macOS/iOS) encodes FULL-range BT.709 (computer graphics are
+            // full-range 0-255). Tagging LIMITED washed colors out; tagging nothing let the decoder
+            // assume limited and over-expand -> harsh/oversaturated. FULL + BT709 matches the source.
             format.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+            format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
             format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
         if (realtimeDecoderPriority) {
@@ -218,7 +325,12 @@ class VideoRenderer {
 
         val thread = HandlerThread("VideoRendererCb").also { it.start() }
         callbackThread = thread
+        // Hardware decoder: it sustains full 1080p60 and stays sharp (software can't keep up -> drops
+        // -> trails, since the AirPlay stream sends IDRs only rarely so any dropped frame ghosts until
+        // the next keyframe). The right strategy is therefore to feed EVERY frame in order and never
+        // drop/skip while the decoder keeps up. The rare HW-decoder wedge is handled by the watchdog.
         val c = MediaCodec.createDecoderByType(mime)
+        Log.i(TAG, "Decoder: default-hw($mime)")
         c.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(mc: MediaCodec, index: Int) {
                 synchronized(lock) {
@@ -242,6 +354,7 @@ class VideoRenderer {
                     } else {
                         mc.releaseOutputBuffer(index, true)   // render immediately
                     }
+                    _renderedTotal++
                     _recordOutputFrameTime()
                 } catch (e: IllegalStateException) {
                     // codec stopped between callback dispatch and release; ignore
@@ -267,6 +380,12 @@ class VideoRenderer {
 
     private fun stopCodec() {
         running = false
+        _stalledSecs = 0
+        _stallRestartNeeded = false
+        _waitingForKeyframe = false
+        _waitingSecs = 0
+        _renderedAtLastReset = _renderedTotal
+        _queuedAtLastReset = _queuedTotal
         _frameIntervalIdx = 0
         _frameIntervalCount = 0
         _lastOutputFrameNs = 0L
@@ -322,6 +441,16 @@ class VideoRenderer {
         val mean = sum / count
         val variance = (sumSq / count) - (mean * mean)
         return (kotlin.math.sqrt(variance.coerceAtLeast(0.0)) / 1000.0).toLong()
+    }
+
+    /** Find a software decoder for the mime (c2.android.* / OMX.google.*), or null if none. */
+    private fun _findSoftwareDecoder(mime: String): String? {
+        val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+        return list.codecInfos.firstOrNull { info ->
+            !info.isEncoder &&
+                info.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
+                (info.name.startsWith("c2.android.", true) || info.name.startsWith("OMX.google.", true))
+        }?.name
     }
 
     companion object {

@@ -11,10 +11,9 @@ object Prefs {
     const val AUTO_START = "auto_start"; const val DEF_AUTO_START = true
     const val BOOT_AUTO_START = "boot_auto_start"; const val DEF_BOOT_AUTO_START = true
     const val H265_ENABLED = "h265_enabled"; const val DEF_H265_ENABLED = true
-    // Default OFF: forcing COLOR_RANGE_LIMITED / BT709 on the decoder washes out colors on some
-    // Amlogic SoCs (pale, low-saturation image). Letting the decoder use the stream's native color
-    // signalling renders correctly; SDR-enforcement stays available as a toggle for HDR-prone boxes.
-    const val ENFORCE_SDR = "enforce_sdr"; const val DEF_ENFORCE_SDR = false
+    // Default ON with FULL-range BT.709 (set in VideoRenderer): matches desktop mirror color so the
+    // image isn't washed out (LIMITED) nor harsh/oversaturated (no tag, decoder over-expands).
+    const val ENFORCE_SDR = "enforce_sdr"; const val DEF_ENFORCE_SDR = true
     val KEY_ALLOW_FRAME_DROP: String = MediaFormat.KEY_ALLOW_FRAME_DROP; const val DEF_KEY_ALLOW_FRAME_DROP = true
     val KEY_PRIORITY: String = MediaFormat.KEY_PRIORITY; const val DEF_KEY_PRIORITY = true
     val KEY_OPERATING_RATE: String = MediaFormat.KEY_OPERATING_RATE; const val DEF_KEY_OPERATING_RATE = false

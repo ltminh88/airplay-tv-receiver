@@ -62,6 +62,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Keep the display awake while the receiver UI is visible. On TV boxes the system sleep
+        // timer otherwise turns the panel off (HDMI drops to "no signal", and waking can transiently
+        // flip the output to CVBS), interrupting an active or waiting mirror session.
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
