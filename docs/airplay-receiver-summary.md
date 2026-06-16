@@ -35,6 +35,11 @@ Branch: `feat/android-tv-render-fixes`. Validated on **X96Air_P2** (Amlogic `fra
   implemented.)
 
 ## Operating notes
+- **Boot auto-start:** implemented (`BootReceiver` + `boot_auto_start` pref, default ON; handles
+  BOOT_COMPLETED + QUICKBOOT_POWERON). **BUT the X96Air_P2 ROM does not deliver any boot broadcast to
+  this sideloaded app** (verified across reboots) — so on that box the app does NOT auto-start. Fix:
+  add it to the box's "auto-start / self-start" allowlist if present, or just open the app once after
+  a reboot (then it runs in the background). Works automatically on ROMs that honor boot broadcasts.
 - **One receiver at a time:** AirScreen and this app both bind AirPlay port 7000 — stop one before the
   other (`adb shell am force-stop com.ionitech.airscreen`).
 - **Harsh/oversaturated colors?** Turn OFF the box's SDR→HDR: open
