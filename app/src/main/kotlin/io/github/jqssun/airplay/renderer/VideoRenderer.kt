@@ -34,7 +34,13 @@ class VideoRenderer {
     private val availableInputs = ArrayDeque<Int>()        // input buffer indices the codec handed us
     private val pendingFrames = ArrayDeque<Frame>()        // frames waiting for an input buffer
     private data class Frame(val data: ByteArray, val ptsUs: Long)
-    private val MAX_PENDING = 8                            // bound the backlog; drop oldest beyond this
+    // Bound the backlog. Sized to absorb a high-bitrate burst: when macOS ramps the mirror bitrate up
+    // (the sharp moments), frames briefly arrive faster than the decoder hands back input buffers. With
+    // a small bound (8) that transient burst overflowed -> we panic-cleared and waited for the next IDR,
+    // which macOS sends rarely -> the screen froze until a manual reconnect. A larger backlog rides out
+    // the burst so the decoder catches up instead of freezing. The Amlogic 1080p HW decoder easily
+    // sustains multi-Mbps (it does 4K HEVC), so the bottleneck was this queue, not decode throughput.
+    private val MAX_PENDING = 24
 
     // cache last keyframe so decoder can bootstrap after late surface attach / codec restart
     private var cachedKeyframe: ByteArray? = null
@@ -74,6 +80,13 @@ class VideoRenderer {
     var scheduledOutputBufferRelease = false
     var benchmarkLog = false
     var benchmarkLogCallback: ((String) -> Unit)? = null
+
+    // GL sharpening: when enabled, decoded frames are routed through a GLES2 unsharp-mask stage
+    // before reaching the display Surface. On any GL failure the path falls back to direct-Surface
+    // rendering so the screen never goes black.
+    var sharpenEnabled = true
+    var sharpenStrength = 0.5f
+    private var glSharpen: GlSharpenRenderer? = null
     private var _framesThisSec = 0
     private var _bytesThisSec = 0L
     private var _lastStatReset = 0L
@@ -140,13 +153,15 @@ class VideoRenderer {
             if (renderedThisSec > 0L) _consecutiveRestarts = 0   // confirmed recovery
             if (fps > 0 && renderedThisSec == 0L) {
                 _stalledSecs++
-                // give up after a few failed restarts: a true HW-decoder wedge needs a fresh IDR
-                // (only a client reconnect provides one), so looping restarts just thrashes.
-                if (_stalledSecs >= 3 && _consecutiveRestarts < 4) {
+                // Recover faster: detect the stall at 2s (was 3s) so a burst-induced freeze clears
+                // before the user reaches for reconnect. Allow more restart attempts (6, was 4) — each
+                // restart re-bootstraps from the cached keyframe, which often un-sticks the decoder
+                // without a manual reconnect. A true HW wedge still ultimately needs a client reconnect.
+                if (_stalledSecs >= 2 && _consecutiveRestarts < 6) {
                     _stallRestartNeeded = true
                     _consecutiveRestarts++
                     Log.w(TAG, "decoder stall (${_stalledSecs}s, restart #$_consecutiveRestarts: fed=$fps queued=$queuedThisSec) -> restarting codec")
-                } else if (_consecutiveRestarts >= 4) {
+                } else if (_consecutiveRestarts >= 6) {
                     Log.w(TAG, "decoder wedged after $_consecutiveRestarts restarts; needs client reconnect")
                 }
             } else {
@@ -232,6 +247,7 @@ class VideoRenderer {
             pendingFrames.clear()
             _waitingForKeyframe = true
             droppedFrames++
+            Log.w(TAG, "pending backlog overflow (>$MAX_PENDING) during bitrate burst -> skip to keyframe")
             return
         }
         pendingFrames.addLast(Frame(data, ptsUs))
@@ -311,6 +327,13 @@ class VideoRenderer {
         if (realtimeDecoderPriority) {
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
         }
+        // Amlogic-specific decoder tuning, matched to AirScreen (decompiled ea/d.java): for an
+        // OMX.amlogic.avc.decoder it sets "4k-osd"=0. On this box that is the SAME decoder we use
+        // (createDecoderByType -> OMX.amlogic.avc.decoder.awesome, the only HW AVC decoder present), so we
+        // mirror its one Amlogic-specific format key. "4k-osd"=0 keeps the decoder off the 4K-OSD scaling
+        // path for a 1080p stream. ("low-latency"/"vdec-lowlatency" in that file are gated to MediaTek
+        // decoders only, NOT Amlogic, so we don't set them here.) Harmless if the decoder ignores the key.
+        format.setInteger("4k-osd", 0)
         if (operatingRateHint && android.os.Build.VERSION.SDK_INT >= 23) {
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
         }
@@ -322,6 +345,29 @@ class VideoRenderer {
         pendingFrames.clear()
         _ptsBaseUs = Long.MIN_VALUE
         _wallBaseNs = 0L
+
+        // Attempt to set up the GL sharpening path. The decoder will render into glSharpen's
+        // inputSurface (an OES SurfaceTexture), and GlSharpenRenderer blits the sharpened result
+        // to the real display Surface. On any failure we fall through to the direct-Surface path
+        // so the screen never goes black — this is entirely additive.
+        val decodeTarget: Surface = if (sharpenEnabled && alignedW > 0 && alignedH > 0) {
+            val gl = GlSharpenRenderer()
+            gl.strength = sharpenStrength
+            try {
+                gl.init(s, alignedW, alignedH)
+                glSharpen = gl
+                Log.i(TAG, "GL sharpen path active (strength=$sharpenStrength)")
+                gl.inputSurface!!   // expression value -> decodeTarget
+            } catch (e: Exception) {
+                Log.w(TAG, "GL sharpen init failed, falling back to direct surface: ${e.message}")
+                gl.release()   // clean up the partially initialised renderer
+                glSharpen = null
+                s   // fall back to the raw display Surface
+            }
+        } else {
+            glSharpen = null
+            s
+        }
 
         val thread = HandlerThread("VideoRendererCb").also { it.start() }
         callbackThread = thread
@@ -370,7 +416,7 @@ class VideoRenderer {
             }
         }, Handler(thread.looper))
 
-        c.configure(format, s, null, 0)
+        c.configure(format, decodeTarget, null, 0)
         c.start()
         codec = c
         codecName = if (h265) "H.265" else "H.264"
@@ -404,6 +450,11 @@ class VideoRenderer {
         callbackThread = null
         availableInputs.clear()
         pendingFrames.clear()
+        // Release the GL stage AFTER the codec has been fully stopped. This ensures no
+        // in-flight onOutputBufferAvailable call is still rendering into the OES texture when
+        // we tear down the EGL context.
+        glSharpen?.release()
+        glSharpen = null
     }
 
     fun release() = synchronized(lock) {

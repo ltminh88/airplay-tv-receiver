@@ -39,4 +39,9 @@ object Prefs {
     const val AUTO_FULLSCREEN = "auto_fullscreen"; const val DEF_AUTO_FULLSCREEN = true
     const val AUTO_AUDIO_MODE = "auto_audio_mode"; const val DEF_AUTO_AUDIO_MODE = true
     const val LAUNCH_ON_CONNECT = "launch_on_connect"; const val DEF_LAUNCH_ON_CONNECT = true
+    // GL sharpening: applies an unsharp-mask GLES2 pass between decoder and display Surface.
+    // Strength is stored as int 0-100 (maps to float 0..1 in VideoRenderer) so SharedPreferences
+    // sliders / ADB commands use whole-number percentages.
+    const val SHARPEN_ENABLED = "sharpen_enabled"; const val DEF_SHARPEN_ENABLED = true
+    const val SHARPEN_STRENGTH = "sharpen_strength"; const val DEF_SHARPEN_STRENGTH = 30
 }

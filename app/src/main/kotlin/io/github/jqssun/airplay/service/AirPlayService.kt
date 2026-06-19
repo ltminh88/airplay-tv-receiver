@@ -206,6 +206,8 @@ class AirPlayService : Service(), RaopCallbackHandler {
         videoRenderer.benchmarkLog = prefs.getBoolean(Prefs.BENCHMARK_LOG, Prefs.DEF_BENCHMARK_LOG)
         videoRenderer.benchmarkLogCallback = { msg -> logCallback?.invoke(msg) }
         videoRenderer.scheduledOutputBufferRelease = prefs.getBoolean(Prefs.SCHEDULED_OUTPUT_BUFFER_RELEASE, Prefs.DEF_SCHEDULED_OUTPUT_BUFFER_RELEASE)
+        videoRenderer.sharpenEnabled = prefs.getBoolean(Prefs.SHARPEN_ENABLED, Prefs.DEF_SHARPEN_ENABLED)
+        videoRenderer.sharpenStrength = prefs.getInt(Prefs.SHARPEN_STRENGTH, Prefs.DEF_SHARPEN_STRENGTH) / 100f
         audioRenderer.realtimeDecoderPriority = realtimePriority
         NativeBridge.nativeSetH265Enabled(nativeHandle, h265)
         NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)

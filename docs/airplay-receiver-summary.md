@@ -14,6 +14,23 @@ Branch: `feat/android-tv-render-fixes`. Validated on **X96Air_P2** (Amlogic `fra
   and ramps up to **~14 Mbps** as the session stabilises — hence "the longer it runs, the sharper it gets."
 - **Same stream as AirScreen:** both receive H.264 1920×1080 SDR via the same `amlogic.avc.decoder`.
   AirScreen's edge is proprietary vendor decode tuning, not a higher-quality stream.
+- **Advertised model does NOT control bitrate.** Tested advertising `AppleTV6,2` + srcvers `377.40.00`
+  (vs default `AppleTV3,2`/`220.68`) — connected fine, ran 5h stable, but **zero sharpness change**.
+  Bitrate is set by the macOS adaptive encoder (network + content), not the receiver's model string.
+  Measured on wired LAN: idle/static screen ≈ **19–56 kbps** (soft, faint cursor ghosting), active use
+  ramps to **2–4.4 Mbps** (sharp, ~0 drops). The "sharp" experience = sustained activity holding bitrate
+  high; it cannot be forced up while the screen is static. Current advertised model: `AppleTV6,2`
+  (kept — legacy features bitmap retained so the AirPlay-1 path still works).
+- **H.265 mirror CANNOT be triggered from macOS (empirically tested).** The receiver already has full
+  HEVC support (decode path in `VideoRenderer.kt`, feature bit 42 set, `DEF_H265_ENABLED=true`). Tested
+  with every condition met: `AppleTV6,2` + multicodec bit 42 + Apple-Silicon **MacBook Air M2** sender +
+  advertised display `3840×2160`. Result: macOS sent **4K but still H.264, never H.265**, and it was
+  **not sharper** — because bitrate stayed adaptive/low (~50 kbps idle) and spreading the same bits over
+  4× the pixels gives no detail gain (then downscaled to the 1080p panel). The Amlogic box decoded 4K
+  H.264 fine (63fps, ~0 drops). Conclusion: macOS does NOT send HEVC for desktop *mirroring* to
+  third-party receivers (the "4K→HEVC" rule is for AirPlay *video* streaming, not mirroring). Reverted
+  advertised resolution to 1080p (auto) — 4K = 4× decode cost + heat + wedge risk for zero benefit.
+  **This is the absolute ceiling of AirPlay-1 screen mirroring; do not re-try H.265/4K/model levers.**
 - **AirPlay-1 sends IDRs rarely** → any dropped/skipped frame ghosts (cursor trails) until the next
   keyframe. Fix: feed every frame in order, never drop mid-GOP.
 - **Amlogic HW decoder wedges** under sustained high-motion video (fed continues, output stops).
