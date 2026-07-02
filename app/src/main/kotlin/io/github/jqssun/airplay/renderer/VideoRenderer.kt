@@ -40,7 +40,22 @@ class VideoRenderer {
     // which macOS sends rarely -> the screen froze until a manual reconnect. A larger backlog rides out
     // the burst so the decoder catches up instead of freezing. The Amlogic 1080p HW decoder easily
     // sustains multi-Mbps (it does 4K HEVC), so the bottleneck was this queue, not decode throughput.
-    private val MAX_PENDING = 24
+    //
+    // INPUT backlog bound. We never drop an input frame under normal load (dropping input breaks the
+    // H.264 reference chain → corruption, since AirPlay-1 sends IDRs rarely). Latency is kept low NOT by
+    // shrinking this queue but by the OUTPUT-side skip (see LATENCY_SKIP_THRESHOLD / onOutputBufferAvailable):
+    // when backlogged, the decoder still decodes every frame (refs intact) but stale frames are released
+    // WITHOUT display to fast-forward. So this only needs headroom for the decode-vs-arrival transient;
+    // if it still fills (genuine wedge) _enqueue backpressures then hard-resyncs.
+    private val MAX_PENDING = 16
+    // When more than this many INPUT frames are still backlogged, the decoder's current OUTPUT frame is
+    // already stale → release it WITHOUT displaying (decode kept for references) to fast-forward to the
+    // newest frame. Small so catch-up is aggressive and typing stays responsive; 0-2 in steady state.
+    private val LATENCY_SKIP_THRESHOLD = 2
+    // How long _enqueue will backpressure (block the TCP feed) before deciding the decoder is truly
+    // wedged and hard-resyncing. Long enough to ride out a GL/decoder hiccup, short enough that a real
+    // wedge recovers quickly.
+    private val BACKPRESSURE_MAX_MS = 1500
 
     // cache last keyframe so decoder can bootstrap after late surface attach / codec restart
     private var cachedKeyframe: ByteArray? = null
@@ -57,6 +72,13 @@ class VideoRenderer {
     // diagnostic: frames actually released to the surface (onOutputBufferAvailable)
     @Volatile private var _renderedTotal = 0L
     private var _renderedAtLastReset = 0L
+    // decoder OUTPUT frames = displayed + skipped-for-latency. The stall watchdog keys off THIS (not
+    // _renderedTotal) so that intentionally skipping stale display frames during catch-up is never
+    // mistaken for a decoder wedge.
+    @Volatile private var _outputTotal = 0L
+    private var _outputAtLastReset = 0L
+    // live snapshot of pendingFrames.size, read off-lock in the output callback for the latency skip
+    @Volatile private var _pendingDepth = 0
     // stall watchdog: the Amlogic decoder can wedge after a long session (keeps accepting input but
     // stops emitting output). Detect "fed but nothing rendered" for N seconds and auto-restart the
     // codec so the user doesn't have to disconnect/reconnect by hand.
@@ -86,6 +108,8 @@ class VideoRenderer {
     // rendering so the screen never goes black.
     var sharpenEnabled = true
     var sharpenStrength = 0.5f
+    var sharpenContrast = 1.0f      // 1.0 = unchanged; >1 = punchier
+    var sharpenSaturation = 1.0f    // 1.0 = unchanged; >1 = richer color (fixes washed-out look)
     private var glSharpen: GlSharpenRenderer? = null
     private var _framesThisSec = 0
     private var _bytesThisSec = 0L
@@ -127,6 +151,10 @@ class VideoRenderer {
             framePacingJitterUs = _computeFramePacingJitterUs()
             val renderedThisSec = _renderedTotal - _renderedAtLastReset
             _renderedAtLastReset = _renderedTotal
+            // decoder OUTPUT this second (displayed + latency-skipped). Wedge detection keys off this, not
+            // renderedThisSec, because during latency catch-up we intentionally skip displaying frames.
+            val outputThisSec = _outputTotal - _outputAtLastReset
+            _outputAtLastReset = _outputTotal
             // stall watchdog: frames fed but none rendered => decoder wedged. After 2 such seconds,
             // flag a codec restart (handled in feedFrame under lock).
             // wedge signal: frames keep ARRIVING from the source (fps>0) but the decoder renders
@@ -142,16 +170,29 @@ class VideoRenderer {
             // visual glitch is far better than a permanent freeze (queued stays 0 -> nothing decodes).
             if (_waitingForKeyframe) {
                 _waitingSecs++
-                if (_waitingSecs >= 2) {
+                // We only enter keyframe-wait on codec (re)start or the rare hard-resync after a genuine
+                // decoder wedge (backpressure now prevents the overflow-drop that used to trigger this
+                // constantly). While waiting we skip feeding, so the Surface holds its last cleanly-
+                // decoded frame. macOS normally sends an IDR within a second or two and the wait clears
+                // itself. The timeout is only a safety against a missed/very-late IDR: resume feeding
+                // (at worst a brief self-healing glitch until the next IDR) rather than freezing forever.
+                // NO restart-loop here — restarting does not summon an IDR and only produced a minute of
+                // stale/frozen frames.
+                if (_waitingSecs >= 3) {
                     _waitingForKeyframe = false
                     _waitingSecs = 0
-                    Log.w(TAG, "keyframe wait timed out -> resuming feed without resync")
+                    Log.w(TAG, "keyframe wait timed out -> resume feed")
                 }
             } else {
                 _waitingSecs = 0
             }
-            if (renderedThisSec > 0L) _consecutiveRestarts = 0   // confirmed recovery
-            if (fps > 0 && renderedThisSec == 0L) {
+            if (outputThisSec > 0L) _consecutiveRestarts = 0   // confirmed recovery (decoder producing)
+            // A real wedge = "fed the codec but it emitted NO output at all" (not merely "didn't display").
+            // While _waitingForKeyframe we deliberately SKIP feeding (waiting for a clean IDR), so nothing
+            // is produced by design — NOT a stall. During latency catch-up we produce output but skip
+            // displaying it — also NOT a stall (outputThisSec>0). Only zero decoder output while frames
+            // arrive is a genuine wedge.
+            if (fps > 0 && outputThisSec == 0L && !_waitingForKeyframe) {
                 _stalledSecs++
                 // Recover faster: detect the stall at 2s (was 3s) so a burst-induced freeze clears
                 // before the user reaches for reconnect. Allow more restart attempts (6, was 4) — each
@@ -169,8 +210,8 @@ class VideoRenderer {
             }
             // always-on lightweight diagnostic: fed vs rendered tells us if frames arrive but never
             // reach the surface (decoder stall) vs simply aren't being sent (source idle)
-            Log.i(TAG, "video: fed/s=$fps rendered/s=$renderedThisSec bitrate=${bitrateBps / 1000}kbps " +
-                "totalFed=$frameCount totalRendered=$_renderedTotal dropped=$droppedFrames " +
+            Log.i(TAG, "video: fed/s=$fps out/s=$outputThisSec shown/s=$renderedThisSec bitrate=${bitrateBps / 1000}kbps " +
+                "queue=$_pendingDepth totalFed=$frameCount totalShown=$_renderedTotal dropped=$droppedFrames " +
                 "codec=$codecName ${videoWidth}x${videoHeight}")
             _framesThisSec = 0
             _bytesThisSec = 0
@@ -240,22 +281,43 @@ class VideoRenderer {
         }
     }
 
-    /** Queue a frame; if the decoder fell behind, skip cleanly to the next keyframe (don't drop
-     *  mid-GOP — that breaks the P-frame reference chain and causes cursor trails). */
+    /**
+     * Queue a frame. Mirror video arrives over TCP (reliable, IN-ORDER) — no frame is ever lost on the
+     * wire, so the ONLY way the H.264 reference chain breaks (→ macroblock corruption / "vỡ hình") is if
+     * WE drop a frame here. Therefore we NEVER drop under normal backpressure: if the decode+GL pipeline
+     * has fallen behind (queue full), we WAIT for it to drain. Blocking this (JNI mirror) thread
+     * backpressures the TCP socket, so macOS simply throttles its send rate instead of us corrupting the
+     * stream. Only a GENUINE HW-decoder wedge (output permanently stops for BACKPRESSURE_MAX_MS) forces a
+     * hard resync — that is rare and unavoidable. Caller holds [lock]; lock.wait() releases it so the
+     * codec's input/output callbacks can run and drain the queue, then notifyAll() wakes us.
+     */
     private fun _enqueue(data: ByteArray, ptsUs: Long) {
         if (pendingFrames.size >= MAX_PENDING) {
-            pendingFrames.clear()
-            _waitingForKeyframe = true
-            droppedFrames++
-            Log.w(TAG, "pending backlog overflow (>$MAX_PENDING) during bitrate burst -> skip to keyframe")
-            return
+            var waitedMs = 0
+            while (pendingFrames.size >= MAX_PENDING && waitedMs < BACKPRESSURE_MAX_MS && codec != null) {
+                try { lock.wait(20) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                waitedMs += 20
+            }
+            if (pendingFrames.size >= MAX_PENDING) {
+                // Still full after the cap → the decoder is genuinely wedged (not mere backpressure).
+                // Hard-resync: drop the backlog and wait for the next keyframe. Rare; keyframe-resync +
+                // stall watchdog handle recovery. This is the ONLY path that ever drops a mirror frame.
+                pendingFrames.clear()
+                _pendingDepth = 0
+                _waitingForKeyframe = true
+                droppedFrames++
+                Log.w(TAG, "decoder wedged (backlog full ${BACKPRESSURE_MAX_MS}ms) -> hard resync to keyframe")
+                return
+            }
         }
         pendingFrames.addLast(Frame(data, ptsUs))
+        _pendingDepth = pendingFrames.size
     }
 
     /** Feed queued frames into any input buffers the codec has made available. Caller holds lock. */
     private fun _pumpInputs() {
         val c = codec ?: return
+        var drained = false
         while (availableInputs.isNotEmpty() && pendingFrames.isNotEmpty()) {
             val idx = availableInputs.pollFirst()
             val frame = pendingFrames.pollFirst()
@@ -265,12 +327,16 @@ class VideoRenderer {
                 buf.put(frame.data)
                 c.queueInputBuffer(idx, 0, frame.data.size, frame.ptsUs, 0)
                 _queuedTotal++
+                drained = true
             } catch (e: IllegalStateException) {
                 // codec was torn down mid-feed; stop touching it
                 Log.w(TAG, "queueInputBuffer failed (codec stopping): ${e.message}")
                 return
             }
         }
+        _pendingDepth = pendingFrames.size
+        // Wake any feedFrame thread blocked in _enqueue backpressure now that space has freed.
+        if (drained) lock.notifyAll()
     }
 
     private fun _isKeyframe(data: ByteArray, isH265: Boolean): Boolean {
@@ -353,6 +419,8 @@ class VideoRenderer {
         val decodeTarget: Surface = if (sharpenEnabled && alignedW > 0 && alignedH > 0) {
             val gl = GlSharpenRenderer()
             gl.strength = sharpenStrength
+            gl.contrast = sharpenContrast
+            gl.saturation = sharpenSaturation
             try {
                 gl.init(s, alignedW, alignedH)
                 glSharpen = gl
@@ -389,6 +457,17 @@ class VideoRenderer {
             override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
                 // render outside the lock to avoid blocking input feeding / stopCodec
                 try {
+                    if (codec !== mc) { mc.releaseOutputBuffer(index, false); return }
+                    _outputTotal++   // decoder produced output (watchdog liveness, counts even if skipped)
+                    // Latency catch-up: if input frames are still backlogged, this decoded frame is
+                    // already stale -> release WITHOUT displaying to fast-forward to the newest frame.
+                    // The decoder already decoded it so the reference chain stays intact (no corruption);
+                    // we just skip showing an out-of-date frame. Keeps input->display latency low during
+                    // macOS bursts without ever dropping an INPUT frame.
+                    if (_pendingDepth > LATENCY_SKIP_THRESHOLD) {
+                        mc.releaseOutputBuffer(index, false)
+                        return
+                    }
                     if (scheduledOutputBufferRelease) {
                         val ptsUs = info.presentationTimeUs
                         synchronized(lock) {
@@ -431,6 +510,8 @@ class VideoRenderer {
         _waitingForKeyframe = false
         _waitingSecs = 0
         _renderedAtLastReset = _renderedTotal
+        _outputAtLastReset = _outputTotal
+        _pendingDepth = 0
         _queuedAtLastReset = _queuedTotal
         _frameIntervalIdx = 0
         _frameIntervalCount = 0

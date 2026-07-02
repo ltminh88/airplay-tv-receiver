@@ -43,5 +43,12 @@ object Prefs {
     // Strength is stored as int 0-100 (maps to float 0..1 in VideoRenderer) so SharedPreferences
     // sliders / ADB commands use whole-number percentages.
     const val SHARPEN_ENABLED = "sharpen_enabled"; const val DEF_SHARPEN_ENABLED = true
-    const val SHARPEN_STRENGTH = "sharpen_strength"; const val DEF_SHARPEN_STRENGTH = 30
+    // Default 0 = the unsharp taps are skipped (see shader), so the GL pass is the cheap colour-only path
+    // (contrast+saturation) that a weak box GPU can hold at 60fps. Raise only if the GPU can afford it.
+    const val SHARPEN_STRENGTH = "sharpen_strength"; const val DEF_SHARPEN_STRENGTH = 0
+    // Contrast & saturation applied in the same GL pass. Stored as int percent of the multiplier:
+    // 100 = unchanged (x1.0), 115 = x1.15, etc. Defaults give a mild punch-up to counter the slightly
+    // washed-out look of the low-bitrate mirror stream, without looking unnatural.
+    const val SHARPEN_CONTRAST = "sharpen_contrast"; const val DEF_SHARPEN_CONTRAST = 101
+    const val SHARPEN_SATURATION = "sharpen_saturation"; const val DEF_SHARPEN_SATURATION = 102
 }

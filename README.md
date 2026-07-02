@@ -17,12 +17,18 @@
 
 ## What this fork adds (vs upstream)
 
-- **Anti-freeze:** larger decoder backlog (`MAX_PENDING=24`) so high-bitrate bursts no longer panic-clear and
-  reset to a soft/frozen image (the old build needed a manual reconnect). Faster stall watchdog (2s).
-- **GL sharpening:** a GLES2 unsharp-mask stage (`GlSharpenRenderer`) keeps text crisp even when macOS drops to
-  low bitrate on a static screen. Toggle + strength via prefs (default strength **30**). Falls back to direct
-  rendering if GL init fails (never black-screens).
-- **Amlogic decoder tuning:** sets the `4k-osd` decoder key; advertises `AppleTV6,2` in the AirPlay handshake.
+- **No corruption ("vỡ hình"), by design:** mirror video is delivered over TCP (reliable, in-order), so a frame is
+  never lost on the wire — the only thing that broke the H.264 reference chain was *us* dropping a frame on a
+  backlog overflow. The renderer now **never drops an input frame**: if the pipeline falls behind it applies
+  **backpressure** (the TCP feed waits, so macOS throttles its send rate). See `VideoRenderer._enqueue`.
+- **Low latency without corruption:** decode and display are decoupled — every frame is *decoded* (references
+  intact) but stale frames are *released without display* to fast-forward to the newest (`LATENCY_SKIP_THRESHOLD`).
+  Typing stays responsive even during a macOS multi-Mbps burst.
+- **Colour polish (GPU-cheap):** a GLES2 pass (`GlSharpenRenderer`) applies mild **contrast + saturation** to
+  counter the slightly washed-out low-bitrate stream. The expensive 5-tap unsharp is **off by default**
+  (`sharpen_strength=0`) because the Amlogic Mali GPU can't sustain it at 1080p60 — it's a uniform-branched opt-in.
+  Falls back to direct rendering if GL init fails (never black-screens).
+- **Amlogic decoder tuning:** sets the `4k-osd` decoder key; FULL-range BT.709 SDR colour.
 - Full findings & rationale: [`docs/airplay-receiver-summary.md`](docs/airplay-receiver-summary.md).
 
 ## Build from source
@@ -38,18 +44,25 @@ JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ./gradle
 The **debug** APK is the distributable one (debug-signed → sideload-installable). A release build needs your own
 keystore in `local.properties` (`storeFile/storePassword/keyAlias/keyPassword`) and enables minify.
 
-## Adjust sharpening on-device (no rebuild)
+## Adjust image on-device (no rebuild)
 
-Sharpening reads two prefs in `shared_prefs/settings.xml` (`sharpen_enabled` bool, `sharpen_strength` int 0–100,
-default 30). To change strength:
+The GL pass reads four prefs in `shared_prefs/settings.xml`, all applied on the next codec start (reconnect):
+
+| Pref | Type | Default | Meaning |
+|------|------|---------|---------|
+| `sharpen_enabled` | bool | `true` | Enable the GL pass (colour polish). `false` = pure direct-surface. |
+| `sharpen_strength` | int 0–100 | `0` | Unsharp-mask sharpen. **0 = off** (recommended — the 5-tap is too heavy for this GPU at 60fps). |
+| `sharpen_contrast` | int (percent) | `101` | Contrast multiplier ×1.01. 100 = neutral. |
+| `sharpen_saturation` | int (percent) | `102` | Saturation multiplier ×1.02. 100 = neutral. |
+
+Example — bump saturation a touch (stop the app first so it doesn't overwrite on exit):
 ```bash
-adb shell am force-stop io.github.jqssun.airplay
-printf "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n  <int name=\"sharpen_strength\" value=\"40\" />\n</map>\n" > /tmp/settings.xml
-adb push /tmp/settings.xml /data/local/tmp/settings.xml
-adb shell run-as io.github.jqssun.airplay cp /data/local/tmp/settings.xml /data/data/io.github.jqssun.airplay/shared_prefs/settings.xml
-adb shell monkey -p io.github.jqssun.airplay -c android.intent.category.LAUNCHER 1
+PKG=io.github.jqssun.airplay
+adb shell am force-stop $PKG
+adb shell "run-as $PKG sh -c 'cd /data/data/$PKG/shared_prefs && sed -i \"s/sharpen_saturation\\\" value=\\\"[0-9]*\\\"/sharpen_saturation\\\" value=\\\"110\\\"/\" settings.xml'"
+adb shell monkey -p $PKG -c android.intent.category.LAUNCHER 1
 ```
-Higher = sharper but harsher; 30 is a comfortable reading default.
+Contrast/saturation above ~115 quickly looks over-vivid/harsh on a TV; 101–102 is a calm, natural default.
 
 ## Known limitations (Amlogic box + AirPlay-1)
 
@@ -59,8 +72,29 @@ Higher = sharper but harsher; 30 is a comfortable reading default.
   reconnect to clear.
 - **Boot auto-start** is implemented but the X96Air_P2 ROM does not deliver boot broadcasts to sideloaded apps —
   open the app once after a reboot.
-- A **fresh clone elsewhere** can't fetch the UxPlay submodule's `AppleTV6,2` commit (it lives only locally / not on
-  FDH2/UxPlay). Re-apply the `lib/global.h` change or fork UxPlay if cloning to a new machine.
+- **Sharpen (unsharp) is off by default** — the Mali GPU on these boxes can't sustain the 5-tap at 1080p60 (it
+  throttled display to ~35fps → lag). Colour polish (contrast/saturation) is cheap and stays at 60fps.
+
+## Changelog
+
+### v0.1.0-tvbox (2026-07-02)
+Root-caused and fixed the recurring "vỡ hình" (macroblock corruption) and lag under real use (multi-pane iTerm2):
+- **Corruption fixed at the root.** Mirror is TCP, so frames are never lost on the wire — the corruption was
+  self-inflicted by dropping frames on a backlog overflow (which broke the H.264 reference chain until macOS's rare
+  next IDR). Replaced the drop-on-overflow with **backpressure**: never drop an input frame; let the TCP feed wait so
+  macOS throttles instead. Removed the old restart-loop that turned corruption into a minute-long freeze.
+- **Lag fixed.** Decouple decode from display: decode every frame (references intact) but **skip *displaying* stale
+  frames** to fast-forward to the newest (`LATENCY_SKIP_THRESHOLD`). Input-to-display latency stays low even during
+  a 4–7 Mbps burst.
+- **GPU-appropriate image polish.** The 5-tap unsharp overloaded the Mali GPU (throttled to ~35fps → lag), so it's
+  now **off by default**; the GL pass keeps only cheap **contrast (×1.01) + saturation (×1.02)** to de-wash the
+  colour without the framerate hit. Optimised the GL renderer (reuse vertex buffer, no per-frame `eglMakeCurrent`).
+- **Buildable from a fresh clone again.** The UxPlay submodule now pins the public tag **`v1.73.6`** (`21eef8df`)
+  instead of a local-only commit, so `git submodule update --init --recursive` works anywhere.
+
+### v0.0.9-tvbox (2026-06-19)
+Initial TV-box hardening: async MediaCodec renderer, keyframe-resync, stall watchdog, GL unsharp sharpening,
+`4k-osd` decoder key, FULL-range BT.709 colour, boot auto-start.
 
 ---
 

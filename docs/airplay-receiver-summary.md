@@ -38,12 +38,23 @@ Branch: `feat/android-tv-render-fixes`. Validated on **X96Air_P2** (Amlogic `fra
 
 ## Render design (`VideoRenderer.kt`)
 - Async `MediaCodec` (setCallback) → renders continuously, independent of input cadence.
-- Feed every frame in order; no mid-GOP dropping.
-- Keyframe detection: 3-byte AND 4-byte Annex-B start codes.
-- Bounded keyframe-resync (≤2s) so a late/absent IDR never freezes permanently.
-- Stall watchdog: restart codec when frames arrive but nothing renders for 3s; capped at 4
-  consecutive attempts (a true HW wedge needs reconnect, not restart-thrash).
+- **Never drop an INPUT frame.** Mirror video is TCP (reliable, in-order) → nothing is lost on the wire,
+  so any dropped frame is self-inflicted and breaks the H.264 reference chain (→ macroblock corruption
+  until macOS's rare next IDR). On backlog, apply **backpressure** (the feed thread waits → TCP throttles
+  macOS) instead of dropping. Only a genuine >1.5s decoder wedge hard-resyncs to a keyframe.
+- **Decouple decode from display for low latency.** Decode every frame (references intact) but release
+  stale frames WITHOUT displaying (`releaseOutputBuffer(index, false)`) when input is backlogged, to
+  fast-forward to the newest — keeps input→display latency low during macOS multi-Mbps bursts. The stall
+  watchdog keys off decoder OUTPUT (displayed + skipped), not displayed-only, so catch-up ≠ false wedge.
+- Keyframe detection: 3-byte AND 4-byte Annex-B start codes; bounded keyframe-resync.
 - Color: FULL-range BT.709; input buffer sized to the frame so 1080p keyframes aren't truncated.
+- **GL pass (`GlSharpenRenderer`)** applies cheap contrast+saturation; the 5-tap unsharp is off by default
+  (Mali GPU can't sustain it at 1080p60 — it throttled display to ~35fps and added lag).
+
+## History note
+The earlier "sharpness is hên xui / low bitrate" theory was superseded (2026-07): the real recurring faults
+were **macroblock corruption** (from dropping frames on overflow) and **lag** (from the GL unsharp GPU
+bottleneck + oversized backpressure buffer). Both are fixed above. See README changelog v0.1.0-tvbox.
 
 ## Known limitation
 - **Sustained high-motion video (e.g. YouTube fullscreen)** can wedge the Amlogic HW decoder beyond

@@ -41,6 +41,12 @@ class GlSharpenRenderer {
     /** 0f = pass-through, ~1f = strong sharpening. May be set at any time from any thread. */
     @Volatile var strength: Float = 0.5f
 
+    /** Contrast multiplier around mid-grey. 1.0 = unchanged, >1 = punchier. Set from any thread. */
+    @Volatile var contrast: Float = 1.0f
+
+    /** Saturation multiplier around luma. 1.0 = unchanged, >1 = richer color (fixes washed-out look). */
+    @Volatile var saturation: Float = 1.0f
+
     /** True while the GL pipeline is operational. */
     @Volatile var isValid: Boolean = false
         private set
@@ -65,9 +71,17 @@ class GlSharpenRenderer {
     private var uTexMatrix: Int = 0
     private var uStrength: Int = 0
     private var uTexelSize: Int = 0
+    private var uContrast: Int = 0
+    private var uSaturation: Int = 0
 
     private var texWidth: Int = 0
     private var texHeight: Int = 0
+
+    // Full-screen quad vertex buffer, allocated ONCE in _initGl and reused every frame. The previous
+    // code allocated a fresh direct ByteBuffer per frame (60/s) — that GC churn periodically stalled
+    // the GL thread, so it fell behind 60fps, backpressured the decoder, and caused the pending-queue
+    // overflow that broke the reference chain. Allocate-once removes that stall source.
+    private var vertexBuffer: java.nio.FloatBuffer? = null
 
     // ---- vertex data (full-screen quad, CCW) -----------------------------------------------
 
@@ -101,24 +115,31 @@ class GlSharpenRenderer {
         uniform samplerExternalOES uTex;
         uniform float uStrength;
         uniform vec2 uTexelSize;   // (1/width, 1/height) in texture space
+        uniform float uContrast;   // 1.0 = unchanged, >1 = punchier
+        uniform float uSaturation; // 1.0 = unchanged, >1 = richer color
 
         void main() {
-            // Unsharp mask: sharpen = center + amount * (center - blur)
-            // blur approximated with 4-neighbor average (cheap, no extra texture lookup).
-            // offset = strength * 1 texel so at strength=0 all samples collapse to center
-            // (no sharpening) and at strength=1 the offset is exactly 1 texel (crisp TV look).
-            vec2 off = uStrength * uTexelSize;
             vec4 center = texture2D(uTex, vTexCoord);
-            vec4 up     = texture2D(uTex, vTexCoord + vec2(0.0,  off.y));
-            vec4 down   = texture2D(uTex, vTexCoord + vec2(0.0, -off.y));
-            vec4 left   = texture2D(uTex, vTexCoord + vec2(-off.x, 0.0));
-            vec4 right  = texture2D(uTex, vTexCoord + vec2( off.x, 0.0));
-            // result = center + amount*(5*center - up - down - left - right)
-            // amount=0.25 at strength=1 gives a subtle but visible edge lift similar to TV
-            // "Sharpness +2". Higher amount = overshoot/halo; keep it gentle.
-            float amount = 0.25 * uStrength;
-            vec4 sharp = center + amount * (5.0 * center - up - down - left - right);
-            gl_FragColor = clamp(sharp, 0.0, 1.0);
+            vec3 col = center.rgb;
+            // 1) Unsharp mask (OPTIONAL — the 4 neighbour taps are the expensive part on a weak GPU).
+            //    Guarded by a UNIFORM branch: when uStrength≈0 every pixel skips the 4 extra texture
+            //    fetches (coherent branch, no divergence) → the pass costs ~1 sample and easily holds
+            //    60fps. Set strength>0 only if the box's GPU can afford the sharpen.
+            if (uStrength > 0.001) {
+                vec2 off = uStrength * uTexelSize;
+                vec3 up    = texture2D(uTex, vTexCoord + vec2(0.0,  off.y)).rgb;
+                vec3 down  = texture2D(uTex, vTexCoord + vec2(0.0, -off.y)).rgb;
+                vec3 left  = texture2D(uTex, vTexCoord + vec2(-off.x, 0.0)).rgb;
+                vec3 right = texture2D(uTex, vTexCoord + vec2( off.x, 0.0)).rgb;
+                float amount = 0.25 * uStrength;
+                col = col + amount * (5.0 * col - up - down - left - right);
+            }
+            // 2) Saturation: pull toward / push away from luma (Rec.709 weights). Fixes washed color.
+            float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+            col = mix(vec3(luma), col, uSaturation);
+            // 3) Contrast: expand around mid-grey. Cheap ALU, applied last.
+            col = (col - 0.5) * uContrast + 0.5;
+            gl_FragColor = vec4(clamp(col, 0.0, 1.0), center.a);
         }
     """.trimIndent()
 
@@ -252,6 +273,15 @@ class GlSharpenRenderer {
         uTexMatrix = GLES20.glGetUniformLocation(shaderProgram, "uTexMatrix")
         uStrength  = GLES20.glGetUniformLocation(shaderProgram, "uStrength")
         uTexelSize = GLES20.glGetUniformLocation(shaderProgram, "uTexelSize")
+        uContrast  = GLES20.glGetUniformLocation(shaderProgram, "uContrast")
+        uSaturation = GLES20.glGetUniformLocation(shaderProgram, "uSaturation")
+
+        // Allocate the quad vertex buffer once here (reused every frame; see field doc).
+        vertexBuffer = java.nio.ByteBuffer
+            .allocateDirect(QUAD_VERTS.size * 4)
+            .order(java.nio.ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .also { it.put(QUAD_VERTS); it.position(0) }
 
         GLES20.glViewport(0, 0, width, height)
         Log.i(TAG, "GlSharpen init OK ${width}x${height}")
@@ -263,12 +293,10 @@ class GlSharpenRenderer {
         val st = surfaceTexture ?: return
         val display = eglDisplay ?: return
         val surface = eglSurface ?: return
-        val context = eglContext ?: return
+        val buf = vertexBuffer ?: return
         try {
-            // Re-make current in case the GL thread context got lost (rare but possible after
-            // display power cycle). The cost is one JNI call per frame; negligible vs GPU work.
-            egl.eglMakeCurrent(display, surface, surface, context)
-
+            // Context was made current once in _initGl on this dedicated GL thread and stays current —
+            // no per-frame eglMakeCurrent (that JNI call per frame added avoidable overhead).
             st.updateTexImage()
 
             val texMatrix = FloatArray(16)
@@ -281,18 +309,16 @@ class GlSharpenRenderer {
             GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
             GLES20.glUniform1f(uStrength, strength.coerceIn(0f, 1f))
             GLES20.glUniform2f(uTexelSize, 1f / texWidth, 1f / texHeight)
+            GLES20.glUniform1f(uContrast, contrast)
+            GLES20.glUniform1f(uSaturation, saturation)
 
             // Bind OES texture to unit 0.
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(0x8D65, oesTexId)   // GL_TEXTURE_EXTERNAL_OES
 
-            // Interleaved vertex buffer: [x, y, u, v] per vertex, 4 bytes each.
-            val buf = java.nio.ByteBuffer
-                .allocateDirect(QUAD_VERTS.size * 4)
-                .order(java.nio.ByteOrder.nativeOrder())
-                .asFloatBuffer()
-                .also { it.put(QUAD_VERTS); it.position(0) }
+            // Reused interleaved vertex buffer: [x, y, u, v] per vertex, 4 bytes each.
             val stride = 4 * 4   // 4 floats * 4 bytes
+            buf.position(0)
             GLES20.glVertexAttribPointer(aPosition, 2, GLES20.GL_FLOAT, false, stride, buf)
             GLES20.glEnableVertexAttribArray(aPosition)
 
@@ -348,6 +374,7 @@ class GlSharpenRenderer {
 
     /** Tear down all GL resources. Called on the GL thread from [release]. */
     private fun _releaseGl() {
+        vertexBuffer = null
         surfaceTexture?.release()
         surfaceTexture = null
 
