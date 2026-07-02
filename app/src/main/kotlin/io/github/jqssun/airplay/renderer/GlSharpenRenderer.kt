@@ -76,6 +76,12 @@ class GlSharpenRenderer {
 
     private var texWidth: Int = 0
     private var texHeight: Int = 0
+    // Actual output (display) surface size, queried from EGL. The GL viewport MUST match the output
+    // surface, NOT the video size. Using the video size worked by luck for landscape macOS (video ~= the
+    // 16:9 surface) but for a PORTRAIT iPhone frame (e.g. 498x1080) it rendered the quad into a tiny
+    // 512x1088 region of the surface → the image appeared zoomed into a vertical column on the left.
+    private var surfaceWidth: Int = 0
+    private var surfaceHeight: Int = 0
 
     // Full-screen quad vertex buffer, allocated ONCE in _initGl and reused every frame. The previous
     // code allocated a fresh direct ByteBuffer per frame (60/s) — that GC churn periodically stalled
@@ -246,6 +252,15 @@ class GlSharpenRenderer {
 
         check(egl.eglMakeCurrent(display, surface, surface, context)) { "eglMakeCurrent failed" }
 
+        // Query the ACTUAL output surface size (the SurfaceView's buffer, already sized to the video
+        // aspect by the Compose layout). The viewport must match this, not the video size — otherwise a
+        // portrait frame renders into a small corner region (the "left column" bug on iPhone).
+        val sw = IntArray(1); val sh = IntArray(1)
+        egl.eglQuerySurface(display, surface, EGL10.EGL_WIDTH, sw)
+        egl.eglQuerySurface(display, surface, EGL10.EGL_HEIGHT, sh)
+        surfaceWidth = if (sw[0] > 0) sw[0] else width
+        surfaceHeight = if (sh[0] > 0) sh[0] else height
+
         // --- OES texture & SurfaceTexture ---
         val texIds = IntArray(1)
         GLES20.glGenTextures(1, texIds, 0)
@@ -283,8 +298,9 @@ class GlSharpenRenderer {
             .asFloatBuffer()
             .also { it.put(QUAD_VERTS); it.position(0) }
 
-        GLES20.glViewport(0, 0, width, height)
-        Log.i(TAG, "GlSharpen init OK ${width}x${height}")
+        // Viewport = OUTPUT surface size (fills it, exactly like MediaCodec's direct-to-Surface scaling).
+        GLES20.glViewport(0, 0, surfaceWidth, surfaceHeight)
+        Log.i(TAG, "GlSharpen init OK tex=${width}x${height} surface=${surfaceWidth}x${surfaceHeight}")
     }
 
     /** Called on the GL thread by the SurfaceTexture frame-available listener. */

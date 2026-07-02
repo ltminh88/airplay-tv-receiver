@@ -299,14 +299,17 @@ class VideoRenderer {
                 waitedMs += 20
             }
             if (pendingFrames.size >= MAX_PENDING) {
-                // Still full after the cap → the decoder is genuinely wedged (not mere backpressure).
-                // Hard-resync: drop the backlog and wait for the next keyframe. Rare; keyframe-resync +
-                // stall watchdog handle recovery. This is the ONLY path that ever drops a mirror frame.
+                // Still full after the cap → hard-resync: drop the backlog and wait for the next keyframe.
+                // Rare (only a genuine decoder stall). We deliberately do NOT force a codec restart here:
+                // restart-on-overflow thrashes (the fresh codec needs an IDR + re-init time before it can
+                // output, but frames pile up again immediately → restart again → the decoder never gets to
+                // stabilise). The stall watchdog handles a truly stuck decoder; a hardware-degraded decoder
+                // (after long box uptime) needs a box reboot, not a software restart.
                 pendingFrames.clear()
                 _pendingDepth = 0
                 _waitingForKeyframe = true
                 droppedFrames++
-                Log.w(TAG, "decoder wedged (backlog full ${BACKPRESSURE_MAX_MS}ms) -> hard resync to keyframe")
+                Log.w(TAG, "backlog full ${BACKPRESSURE_MAX_MS}ms -> hard resync to keyframe")
                 return
             }
         }
